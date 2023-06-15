@@ -1,0 +1,259 @@
+diff --git a/keylime.conf b/keylime.conf
+index 580d9fe..96ba0e2 100644
+--- a/keylime.conf
++++ b/keylime.conf
+@@ -301,6 +301,9 @@ webhook_url = ''
+ # size of the actual payloads
+ max_upload_size = 104857600
+ 
++# Measured boot policy engine. If not specified, it will use keylime.mba.elchecking.
++measured_boot_policy_engine = opa
++
+ # The name of the boot attestation policy to use in comparing a measured boot event log
+ # with a measured boot reference state.
+ # A policy is a Python object that `isinstance` of `keylime.mba.elchecking.policies.Policy`
+@@ -321,6 +324,11 @@ measured_boot_policy_name = accept-all
+ # The default value for this config item is the empty string.
+ # measured_boot_imports = keylime.mba.elchecking
+ 
++# Info about OPA server if OPA policy engine is used.
++# Default values: ip=127.0.0.1 port=8181
++opa_server_ip = 127.0.0.1
++opa_server_port = 8181
++
+ # Severity labels for revocation events strictly ordered from least severity to
+ # highest severtiy.
+ severity_labels = ["info", "notice", "warning", "error", "critical", "alert", "emergency"]
+diff --git a/keylime/cloud_verifier_common.py b/keylime/cloud_verifier_common.py
+index fa3d782..3af13ac 100644
+--- a/keylime/cloud_verifier_common.py
++++ b/keylime/cloud_verifier_common.py
+@@ -260,8 +260,9 @@ def process_get_status(agent: VerfierMain) -> Dict[str, Any]:
+ 
+     has_mb_refstate = 0
+     try:
+-        mb_refstate = json.loads(cast(str, agent.mb_refstate))
+-        if mb_refstate and mb_refstate.keys():
++        #NKD mb_refstate = json.loads(cast(str, agent.mb_refstate))
++        #NKD if mb_refstate and mb_refstate.keys():
++        if agent.mb_refstate is not None:
+             has_mb_refstate = 1
+     except Exception as e:
+         logger.warning(
+diff --git a/keylime/mba/mba.py b/keylime/mba/mba.py
+index 222739a..c263251 100644
+--- a/keylime/mba/mba.py
++++ b/keylime/mba/mba.py
+@@ -1,14 +1,18 @@
+ import json
+ from typing import Dict, Optional, Set
+ 
+-from keylime import config
++from keylime import config, keylime_logging 
+ from keylime.failure import Failure
+ from keylime.mba.elchecking import mbpolicy, policies
++from keylime.mba.opa import opa_policy 
++
++logger = keylime_logging.init_logging("measured_boot_attestation")
+ 
+ # ###########
+ # when something goes wrong with MBA policies
+ # ###########
+ 
++from keylime import config
+ 
+ class PolicyException(Exception):
+     """
+@@ -29,11 +33,20 @@ def load_policy_engine() -> None:
+     Outputs: <none>, but the keylime policy engine is now loaded.
+     Errors: Possible exceptions raised if the policy engine cannot be loaded.
+     """
+-    try:
+-        policies.load_policies()
+-    except Exception as e:
+-        raise PolicyException from e
+-
++    # Name of the policy engine
++    mb_policy_engine = config.get("verifier", "measured_boot_policy_engine")
++
++    # Default policy engine
++    if mb_policy_engine == "" or mb_policy_engine == "elchecking":
++        logger.info("Using default policy engine")
++        try:
++            policies.load_policies()
++        except Exception as e:
++            raise PolicyException from e
++    elif mb_policy_engine == "opa":
++        logger.info("Using opa policy engine")
++    else: 
++        raise PolicyException('Invalid policy engine')
+ 
+ # ##########
+ # read a policy definition (aka "refstate") from a file.
+@@ -55,8 +68,14 @@ def load_policy_file(policy_path: Optional[str] = None) -> str:
+         if policy_path is None:
+             policy_path = config.get("tenant", "mb_refstate")
+         with open(policy_path, encoding="utf-8") as f:
+-            mb_policy_data = json.load(f)
++            try:
++                mb_policy_data = json.load(f)
++            except:
++                mb_policy_data = f.read()
++                return mb_policy_data
++            
+             return json.dumps(mb_policy_data)
++            
+     except Exception as e:
+         raise PolicyException from e
+ 
+@@ -82,7 +101,16 @@ def evaluate_bootlog(
+     Output:
+     * The list of all failures encountered while evaluating the boot log against the policy.
+     """
+-    return mbpolicy.evaluate_policy(mb_policy_data, mb_measurement_data, pcrsInQuote, agent_id)
++    # Name of the policy engine
++    mb_policy_engine = config.get("verifier", "measured_boot_policy_engine")
++
++    if mb_policy_engine == "" or mb_policy_engine == "elchecking":
++        logger.info("Using deafult policy engine to evalute the policy")
++        return mbpolicy.evaluate_policy(mb_policy_data, mb_measurement_data, pcrsInQuote, agent_id)
++    else:
++        logger.info("Using opa policy engine to evaluate the policy")
++        return opa_policy.evaluate_policy(mb_policy_data, mb_measurement_data, pcrsInQuote, agent_id)
++        
+ 
+ 
+ # ##########
+diff --git a/keylime/mba/opa/__init__.py b/keylime/mba/opa/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/keylime/mba/opa/opa_policy.py b/keylime/mba/opa/opa_policy.py
+new file mode 100644
+index 0000000..7aaa56c
+--- /dev/null
++++ b/keylime/mba/opa/opa_policy.py
+@@ -0,0 +1,54 @@
++import json
++from typing import Optional, Set
++
++from keylime import config, keylime_logging
++from keylime.failure import Component, Failure
++
++from opa_client.opa import OpaClient
++from opa_client.errors import *
++
++logger = keylime_logging.init_logging("measured_boot_opa")
++
++
++def evaluate_policy(
++    mb_refstate_str: Optional[str],
++    mb_measurement_data: Optional[str],
++    mb_pcrs_inquote: Set[int],
++    agent_id: str,
++) -> Failure:
++    failure = Failure(Component.MEASURED_BOOT)
++
++    logger.info("OPA evaluate_policy")
++
++    logger.info(mb_refstate_str)
++    
++    # no evaluation if the refstate is an empty string
++    if not mb_refstate_str:
++        logger.info("mb_refstate_str is empty")
++        return failure
++
++    # Ger OPA server ip and port info
++    server_ip = config.get("verifier", "opa_server_ip", fallback="127.0.0.1")
++    server_port = config.get("verifier", "opa_server_port", fallback="8181")
++
++    # Connect to the OPA server
++    logger.info("Connecting to the OPA server")
++    client = OpaClient(host=server_ip,port=int(server_port),)
++    
++    # Upload the policy file
++    try:
++        client.update_opa_policy_fromstring(mb_refstate_str, "mbpolicy")
++    except RegoParseError:
++         logger.error("Uploading the policy %s failed",mb_refstate_str)
++         return failure
++
++    # Check the policy rule against the eventlog
++    logger.info("Checking the policy rule")
++    result = client.check_permission(input_data=mb_measurement_data, policy_name="mbpolicy", rule_name="allow")
++
++    # Close the connection
++    del client
++    
++    return failure
++
++
+diff --git a/requirements.txt b/requirements.txt
+index d84a4f3..9876fff 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -24,3 +24,6 @@ jinja2>=3.0.0 # BSD
+ # as well as NotRequired on Python < 3.11
+ typing-extensions>=4.0.1 ; python_version < '3.11' #PSF-2.0
+ jsonschema>=2.6.0 # MIT
++
++#OPA measured boot attestation policy engine uses opa-python-client
++opa-python-client>=1.3.4 # MIT
+diff --git a/templates/2.0/mapping.json b/templates/2.0/mapping.json
+index 62e8538..d02c030 100644
+--- a/templates/2.0/mapping.json
++++ b/templates/2.0/mapping.json
+@@ -309,6 +309,11 @@
+                 "option": "max_upload_size",
+                 "default": "104857600"
+             },
++            "measured_boot_policy_engine": {
++                "section": "cloud_verifier",
++                "option": "measured_boot_policy_engine",
++                "default": "opa"
++            },
+             "measured_boot_policy_name": {
+                 "section": "cloud_verifier",
+                 "option": "measured_boot_policy_name",
+@@ -319,6 +324,16 @@
+                 "option": "measured_boot_imports",
+                 "default": "[]"
+             },
++	    "opa_server_ip": {
++                "section": "cloud_verifier",
++                "option": "opa_server_ip",
++                "default": "127.0.0.1"
++            },
++            "opa_server_port": {
++                "section": "cloud_verifier",
++                "option": "opa_server_port",
++                "default": "8181"
++            },
+             "severity_labels": {
+                 "section": "cloud_verifier",
+                 "option": "severity_labels",
+diff --git a/templates/2.0/verifier.j2 b/templates/2.0/verifier.j2
+index 9d6ad68..cb5f218 100644
+--- a/templates/2.0/verifier.j2
++++ b/templates/2.0/verifier.j2
+@@ -139,6 +139,9 @@ max_upload_size = {{ verifier.max_upload_size }}
+ # Timeout in seconds for requests made to agents
+ request_timeout = {{ verifier.request_timeout }}
+ 
++# Measured boot policy engine
++measured_boot_policy_engine = {{ verifier.measured_boot_policy_engine }}
++
+ # The name of the boot attestation policy to use in comparing a measured boot event log
+ # with a measured boot reference state.
+ # A policy is a Python object that `isinstance` of `keylime.elchecking.policies.Policy`
+@@ -158,6 +161,11 @@ measured_boot_policy_name = {{ verifier.measured_boot_policy_name }}
+ # The default value for this config item is the empty list.
+ measured_boot_imports = {{ verifier.measured_boot_imports }}
+ 
++# Info about OPA server if OPA policy engine is used.
++# Default values: ip=127.0.0.1 port=8181
++opa_server_ip = {{ verifier.opa_server_ip }}
++opa_server_port = {{ verifier.opa_server_port }}
++
+ # Severity labels for revocation events strictly ordered from least severity to
+ # highest severtiy.
+ severity_labels = {{ verifier.severity_labels }}
